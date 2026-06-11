@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -342,7 +342,8 @@ test('init is lazy and does not create the database until first operation', asyn
 test('exports and imports a portable snapshot', async () => {
   const sourceDir = makeWorkspace('lcm-export-src');
   const targetDir = makeWorkspace('lcm-export-dst');
-  const snapshotPath = path.join(sourceDir, 'snapshot.json');
+  const exportPath = path.join(sourceDir, 'snapshot.json');
+  const importPath = path.join(targetDir, 'snapshot.json');
   let source;
   let target;
 
@@ -373,12 +374,13 @@ test('exports and imports a portable snapshot', async () => {
     });
     await source.pinSession({ sessionID: 'root', reason: 'keep for export' });
 
-    const exportText = await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+    const exportText = await source.exportSnapshot({ filePath: exportPath, scope: 'all' });
     assert.match(exportText, /sessions=1/);
 
     target = new SqliteLcmStore(targetDir, makeOptions());
     await target.init();
-    const importText = await target.importSnapshot({ filePath: snapshotPath, mode: 'replace' });
+    copyFileSync(exportPath, importPath);
+    const importText = await target.importSnapshot({ filePath: importPath, mode: 'replace' });
     assert.match(importText, /messages=1/);
 
     const describe = await target.describe({ sessionID: 'root' });

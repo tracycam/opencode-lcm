@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -124,7 +124,8 @@ test('fresh init skips missing legacy files without logging', async () => {
 test('snapshot merge import preserves existing target sessions', async () => {
   const sourceWorkspace = makeWorkspace('lcm-merge-src');
   const targetWorkspace = makeWorkspace('lcm-merge-dst');
-  const snapshotPath = path.join(sourceWorkspace, 'merge-snapshot.json');
+  const exportPath = path.join(sourceWorkspace, 'merge-snapshot.json');
+  const importPath = path.join(targetWorkspace, 'merge-snapshot.json');
   let source;
   let target;
 
@@ -138,7 +139,7 @@ test('snapshot merge import preserves existing target sessions', async () => {
       created: 2,
       parts: [textPart('source-session', 'm1', 'm1-p', 'source merge body')],
     });
-    await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+    await source.exportSnapshot({ filePath: exportPath, scope: 'all' });
 
     target = new SqliteLcmStore(targetWorkspace, makeOptions());
     await target.init();
@@ -150,7 +151,8 @@ test('snapshot merge import preserves existing target sessions', async () => {
       parts: [textPart('target-session', 'm2', 'm2-p', 'target local body')],
     });
 
-    const importText = await target.importSnapshot({ filePath: snapshotPath, mode: 'merge' });
+    copyFileSync(exportPath, importPath);
+    const importText = await target.importSnapshot({ filePath: importPath, mode: 'merge' });
     const stats = await target.stats();
     const sourceResult = await target.grep({ query: 'source merge body', scope: 'all' });
     const targetResult = await target.grep({ query: 'target local body', scope: 'all' });
@@ -170,7 +172,8 @@ test('snapshot merge import preserves existing target sessions', async () => {
 test('snapshot import rebuilds stale imported summary graphs before reuse', async () => {
   const sourceWorkspace = makeWorkspace('lcm-stale-summary-src');
   const targetWorkspace = makeWorkspace('lcm-stale-summary-dst');
-  const snapshotPath = path.join(sourceWorkspace, 'stale-summary-snapshot.json');
+  const exportPath = path.join(sourceWorkspace, 'stale-summary-snapshot.json');
+  const importPath = path.join(targetWorkspace, 'stale-summary-snapshot.json');
   let source;
   let target;
 
@@ -206,13 +209,13 @@ test('snapshot import rebuilds stale imported summary graphs before reuse', asyn
       parts: [textPart('source-session', 'm4', 'm4-p', 'portable fresh tail')],
     });
     await source.buildCompactionContext('source-session');
-    await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+    await source.exportSnapshot({ filePath: exportPath, scope: 'all' });
 
-    const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8'));
+    const snapshot = JSON.parse(readFileSync(exportPath, 'utf8'));
     assert.ok(snapshot.summary_nodes.length > 0);
     snapshot.summary_nodes[0].summary_text = 'stale imported summary';
     snapshot.summary_nodes[0].message_ids_json = JSON.stringify(['stale-message-id']);
-    writeFileSync(snapshotPath, JSON.stringify(snapshot, null, 2));
+    writeFileSync(importPath, JSON.stringify(snapshot, null, 2));
 
     target = new SqliteLcmStore(
       targetWorkspace,
@@ -220,7 +223,7 @@ test('snapshot import rebuilds stale imported summary graphs before reuse', asyn
     );
     await target.init();
 
-    const importText = await target.importSnapshot({ filePath: snapshotPath, mode: 'replace' });
+    const importText = await target.importSnapshot({ filePath: importPath, mode: 'replace' });
     const resume = await target.resume('source-session');
     const expanded = await target.expand({ sessionID: 'source-session' });
     const doctor = await target.doctor({ sessionID: 'source-session' });
@@ -239,7 +242,7 @@ test('snapshot import rebuilds stale imported summary graphs before reuse', asyn
   }
 });
 
-test('snapshot paths can be outside the workspace (portable snapshots)', async () => {
+test('snapshot rejects paths outside the workspace (no portable external snapshots)', async () => {
   const workspace = makeWorkspace('lcm-snapshot-paths');
   const outsideWorkspace = makeWorkspace('lcm-snapshot-paths-outside');
   const outsideSnapshotPath = path.join(outsideWorkspace, 'snapshot.json');
@@ -266,19 +269,17 @@ test('snapshot paths can be outside the workspace (portable snapshots)', async (
 
     writeFileSync(outsideSnapshotPath, JSON.stringify(snapshot, null, 2));
 
-    // Export to outside workspace should work (portable snapshots)
-    const exportResult = await store.exportSnapshot({
-      filePath: outsideSnapshotPath,
-      scope: 'all',
-    });
-    assert.match(exportResult, /file=/);
+    // Export to an absolute path outside the workspace must be rejected.
+    await assert.rejects(
+      () => store.exportSnapshot({ filePath: outsideSnapshotPath, scope: 'all' }),
+      /Path must stay within the workspace/,
+    );
 
-    // Import from outside workspace should also work
-    const importResult = await store.importSnapshot({
-      filePath: outsideSnapshotPath,
-      mode: 'replace',
-    });
-    assert.match(importResult, /file=/);
+    // Import from an absolute path outside the workspace must also be rejected.
+    await assert.rejects(
+      () => store.importSnapshot({ filePath: outsideSnapshotPath, mode: 'replace' }),
+      /Path must stay within the workspace/,
+    );
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
@@ -364,7 +365,8 @@ test('snapshot import rejects malformed payloads', async () => {
 test('snapshot replace import rehomes a single-worktree export into the target workspace', async () => {
   const sourceWorkspace = makeWorkspace('lcm-rehome-src');
   const targetWorkspace = makeWorkspace('lcm-rehome-dst');
-  const snapshotPath = path.join(sourceWorkspace, 'rehome-snapshot.json');
+  const exportPath = path.join(sourceWorkspace, 'rehome-snapshot.json');
+  const importPath = path.join(targetWorkspace, 'rehome-snapshot.json');
   let source;
   let target;
 
@@ -378,12 +380,13 @@ test('snapshot replace import rehomes a single-worktree export into the target w
       created: 2,
       parts: [textPart('source-session', 'm1', 'm1-p', 'portable snapshot body')],
     });
-    await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+    await source.exportSnapshot({ filePath: exportPath, scope: 'all' });
 
     target = new SqliteLcmStore(targetWorkspace, makeOptions());
     await target.init();
 
-    const importText = await target.importSnapshot({ filePath: snapshotPath, mode: 'replace' });
+    copyFileSync(exportPath, importPath);
+    const importText = await target.importSnapshot({ filePath: importPath, mode: 'replace' });
     const describe = await target.describe({ sessionID: 'source-session' });
     const grep = await target.grep({
       query: 'portable snapshot body',
@@ -412,7 +415,8 @@ test('snapshot replace import rehomes a single-worktree export into the target w
 test('snapshot replace import preserves a single-worktree export when requested', async () => {
   const sourceWorkspace = makeWorkspace('lcm-preserve-src');
   const targetWorkspace = makeWorkspace('lcm-preserve-dst');
-  const snapshotPath = path.join(sourceWorkspace, 'preserve-snapshot.json');
+  const exportPath = path.join(sourceWorkspace, 'preserve-snapshot.json');
+  const importPath = path.join(targetWorkspace, 'preserve-snapshot.json');
   let source;
   let target;
 
@@ -426,13 +430,14 @@ test('snapshot replace import preserves a single-worktree export when requested'
       created: 2,
       parts: [textPart('source-session', 'm1', 'm1-p', 'preserved snapshot body')],
     });
-    await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+    await source.exportSnapshot({ filePath: exportPath, scope: 'all' });
 
     target = new SqliteLcmStore(targetWorkspace, makeOptions());
     await target.init();
 
+    copyFileSync(exportPath, importPath);
     const importText = await target.importSnapshot({
-      filePath: snapshotPath,
+      filePath: importPath,
       mode: 'replace',
       worktreeMode: 'preserve',
     });
@@ -462,7 +467,8 @@ test('snapshot replace import preserves a single-worktree export when requested'
 test('snapshot replace import can force current-worktree remap for multi-worktree exports', async () => {
   const sourceWorkspace = makeWorkspace('lcm-force-current-src');
   const targetWorkspace = makeWorkspace('lcm-force-current-dst');
-  const snapshotPath = path.join(sourceWorkspace, 'force-current-snapshot.json');
+  const exportPath = path.join(sourceWorkspace, 'force-current-snapshot.json');
+  const importPath = path.join(targetWorkspace, 'force-current-snapshot.json');
   const worktreeA = path.join(sourceWorkspace, 'worktree-a');
   const worktreeB = path.join(sourceWorkspace, 'worktree-b');
   let source;
@@ -485,13 +491,14 @@ test('snapshot replace import can force current-worktree remap for multi-worktre
       created: 4,
       parts: [textPart('session-b', 'm2', 'm2-p', 'multi worktree session b')],
     });
-    await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+    await source.exportSnapshot({ filePath: exportPath, scope: 'all' });
 
     target = new SqliteLcmStore(targetWorkspace, makeOptions());
     await target.init();
 
+    copyFileSync(exportPath, importPath);
     const importText = await target.importSnapshot({
-      filePath: snapshotPath,
+      filePath: importPath,
       mode: 'replace',
       worktreeMode: 'current',
     });
@@ -521,7 +528,8 @@ test('snapshot replace import can force current-worktree remap for multi-worktre
 test('snapshot replace import clears stale FTS rows from replaced sessions', async () => {
   const sourceWorkspace = makeWorkspace('lcm-replace-fts-src');
   const targetWorkspace = makeWorkspace('lcm-replace-fts-dst');
-  const snapshotPath = path.join(sourceWorkspace, 'replace-fts-snapshot.json');
+  const exportPath = path.join(sourceWorkspace, 'replace-fts-snapshot.json');
+  const importPath = path.join(targetWorkspace, 'replace-fts-snapshot.json');
   let source;
   let target;
 
@@ -535,7 +543,7 @@ test('snapshot replace import clears stale FTS rows from replaced sessions', asy
       created: 2,
       parts: [textPart('replace-session', 'm-new', 'm-new-p', 'replacement body only')],
     });
-    await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+    await source.exportSnapshot({ filePath: exportPath, scope: 'all' });
 
     target = new SqliteLcmStore(targetWorkspace, makeOptions());
     await target.init();
@@ -547,7 +555,8 @@ test('snapshot replace import clears stale FTS rows from replaced sessions', asy
       parts: [textPart('replace-session', 'm-old', 'm-old-p', 'stale target body')],
     });
 
-    await target.importSnapshot({ filePath: snapshotPath, mode: 'replace' });
+    copyFileSync(exportPath, importPath);
+    await target.importSnapshot({ filePath: importPath, mode: 'replace' });
 
     const fresh = await target.grep({
       query: 'replacement body only',
@@ -573,7 +582,8 @@ test('snapshot replace import clears stale FTS rows from replaced sessions', asy
 test('snapshot merge import rejects colliding session IDs', async () => {
   const sourceWorkspace = makeWorkspace('lcm-collision-src');
   const targetWorkspace = makeWorkspace('lcm-collision-dst');
-  const snapshotPath = path.join(sourceWorkspace, 'collision-snapshot.json');
+  const exportPath = path.join(sourceWorkspace, 'collision-snapshot.json');
+  const importPath = path.join(targetWorkspace, 'collision-snapshot.json');
   let source;
   let target;
 
@@ -587,7 +597,7 @@ test('snapshot merge import rejects colliding session IDs', async () => {
       created: 2,
       parts: [textPart('shared-session', 'm1', 'm1-p', 'source shared body')],
     });
-    await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+    await source.exportSnapshot({ filePath: exportPath, scope: 'all' });
 
     target = new SqliteLcmStore(targetWorkspace, makeOptions());
     await target.init();
@@ -599,8 +609,9 @@ test('snapshot merge import rejects colliding session IDs', async () => {
       parts: [textPart('shared-session', 'm2', 'm2-p', 'target shared body')],
     });
 
+    copyFileSync(exportPath, importPath);
     await assert.rejects(
-      () => target.importSnapshot({ filePath: snapshotPath, mode: 'merge' }),
+      () => target.importSnapshot({ filePath: importPath, mode: 'merge' }),
       /Snapshot merge would overwrite existing sessions: shared-session/,
     );
 
