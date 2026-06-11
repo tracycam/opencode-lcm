@@ -22,6 +22,8 @@ The `lcm_status` tool exposes several health metrics. You can query these metric
 | `summary_states` | Sum of summary states. | Informational |
 | `artifacts` | Count of externalized artifacts. | Informational |
 | `artifact_blobs` | Deduplicated artifact blobs count. | Informational |
+| `shared_artifact_blobs` | Count of artifact blobs shared across multiple sessions. | Informational |
+| `orphan_artifact_blobs` | Count of orphaned artifact blobs with no session references. | Informational |
 | `message_fts` | Entry count in the message full-text search index. | Informational |
 | `summary_fts` | Total entries in the summary full-text search index. | Informational |
 | `artifact_fts` | Active entries in the artifact full-text search index. | Informational |
@@ -34,7 +36,7 @@ Manual retention tasks help keep the archive size under control. You can preview
 
 Run `lcm_retention_report` to see which sessions and blobs are eligible for pruning. This tool accepts the following arguments:
 
-- `staleSessionDays`: Number of days before a session is considered stale (default is 90).
+- `staleSessionDays`: Number of days before a session is considered stale. This defaults to `undefined` (disabled), meaning stale sessions are never pruned unless you explicitly configure it. Example: set to 90 to prune sessions with no activity in 90 days.
 - `deletedSessionDays`: Number of days before a deleted session is pruned (default is 30).
 - `orphanBlobDays`: Number of days before an orphaned artifact blob is pruned (default is 14).
 - `limit`: Maximum number of candidates to display in the preview (default is 10).
@@ -71,57 +73,17 @@ Run `lcm_unpin_session` to remove the protection pin from a session. This tool a
 
 - `sessionID`: The ID of the session to unpin.
 
-## Cron Examples
+## Automating Retention
 
-Automating retention tasks keeps your database size stable without manual intervention. You can set up a cron job or a systemd timer to run pruning periodically.
+No dedicated CLI command exists for tool invocation. Operations must be driven through the assistant's tool interface.
 
-### Cron Configuration
+To run retention pruning, ask the assistant in an OpenCode session:
 
-Add a line to your crontab to run pruning every day at 2:00 AM. This example uses the OpenCode CLI to invoke the `lcm_retention_prune` tool:
+> Run `lcm_retention_prune` with `apply: true`, `staleSessionDays: 90`, and `deletedSessionDays: 30`.
 
-```sh
-0 2 * * * opencode tool call lcm_retention_prune '{"apply": true, "staleSessionDays": 90, "deletedSessionDays": 30, "orphanBlobDays": 14}' >> /var/log/opencode-lcm-prune.log 2>&1
-```
+The assistant will invoke the tool with your requested arguments and report results.
 
-### Systemd Service and Timer
-
-Alternatively, use a systemd timer for more control over execution and logging. Create a service file at `/etc/systemd/system/opencode-lcm-prune.service`:
-
-```ini
-[Unit]
-Description=Opencode LCM Retention Pruning
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/opencode tool call lcm_retention_prune '{"apply": true}'
-User=opencode
-Group=opencode
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Create a timer file at `/etc/systemd/system/opencode-lcm-prune.timer`:
-
-```ini
-[Unit]
-Description=Run Opencode LCM Retention Pruning Daily
-
-[Timer]
-OnCalendar=*-*-* 02:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-Enable and start the timer:
-
-```sh
-systemctl daemon-reload
-systemctl enable --now opencode-lcm-prune.timer
-```
+To automate recurring retention, create a shell script that starts an OpenCode session and sends an appropriate prompt, then schedule that script via cron or systemd.
 
 ## Alerting Rules
 
@@ -168,48 +130,11 @@ groups:
           description: "The SQLite Write-Ahead Log size is {{ $value }} bytes. Check if checkpointing is running normally."
 ```
 
+> **Note**: OpenCode LCM does not ship a Prometheus exporter. This snippet is a template that you must wire through your own exporter sidecar.
+
 ## CI Integration
 
-Integrating archive checks into your continuous integration pipeline ensures that database corruption or index drift is caught early. You can run `lcm_doctor` as a step in your GitHub Actions workflow.
-
-```yaml
-name: CI
-
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
-jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run tests
-        run: npm test
-
-      - name: Run LCM Doctor Check
-        run: |
-          npx opencode tool call lcm_doctor '{"apply": false}' > doctor_report.txt
-          cat doctor_report.txt
-          if grep -q "issues=[1-9]" doctor_report.txt; then
-            echo "LCM archive issues detected!"
-            exit 1
-          fi
-```
+No dedicated CLI command exists for tool invocation. Operations must be driven through the assistant's tool interface. Consequently, running automated archive checks like `lcm_doctor` directly in a standard CI pipeline is not supported.
 
 ## Troubleshooting
 
