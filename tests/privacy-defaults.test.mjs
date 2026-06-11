@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { resolveOptions } from '../dist/options.js';
-import { compilePrivacyOptions } from '../dist/privacy.js';
+import { compilePrivacyOptions, redactText } from '../dist/privacy.js';
 import { SqliteLcmStore } from '../dist/store.js';
 
 import {
@@ -115,4 +115,40 @@ test('every default redact pattern is a valid non-empty-matching regex', () => {
     redactPatterns: defaults,
   });
   assert.equal(compiled.redactPatterns.length, defaults.length);
+});
+
+// Fixup RED Test: fine-grained GitHub PATs (github_pat_ prefix) must redact.
+test('replaces fine-grained GitHub PATs (github_pat_ prefix)', () => {
+  const compiled = compilePrivacyOptions(resolveOptions({}).privacy);
+  const input = 'see commit github_pat_aaaabbbbccccddddeeeeffffgghhhiiijjj now';
+  const out = redactText(input, compiled);
+  assert.match(out, /\[REDACTED\]/);
+  assert.ok(
+    !out.includes('github_pat_aaaabbbbccccddddeeeeffffgghhhiiijjj'),
+    'fine-grained github_pat_ token must not survive in plaintext',
+  );
+});
+
+// Fixup RED Test: uppercase env-style secret assignments must redact.
+test('replaces uppercase env-style secret assignments', () => {
+  const compiled = compilePrivacyOptions(resolveOptions({}).privacy);
+  const input = 'export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG';
+  const out = redactText(input, compiled);
+  assert.match(out, /\[REDACTED\]/);
+  assert.ok(
+    !out.includes('wJalrXUtnFEMI/K7MDENG'),
+    'uppercase secret value must not survive in plaintext',
+  );
+});
+
+// Fixup RED Test: bare uppercase TOKEN assignment must redact.
+test('replaces uppercase bare TOKEN assignment', () => {
+  const compiled = compilePrivacyOptions(resolveOptions({}).privacy);
+  const input = 'TOKEN=my_super_secret_value_with_at_least_16_chars';
+  const out = redactText(input, compiled);
+  assert.match(out, /\[REDACTED\]/);
+  assert.ok(
+    !out.includes('my_super_secret_value_with_at_least_16_chars'),
+    'uppercase TOKEN value must not survive in plaintext',
+  );
 });

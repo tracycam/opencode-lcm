@@ -38,12 +38,17 @@ export const DEFAULT_REDACT_PATTERNS: string[] = [
   'Bearer\\s+[A-Za-z0-9._\\-]{16,}',
   // PEM private key blocks (uses [\s\S] because compilePattern uses 'gu' flags, NO dotAll)
   '-----BEGIN[A-Z ]+PRIVATE KEY-----[\\s\\S]+?-----END[A-Z ]+PRIVATE KEY-----',
-  // GitHub PATs (classic/finer-grained) minimum 36 alphanumerics
+  // GitHub classic PATs (ghp_/gho_/ghu_/ghs_/ghr_ prefix) minimum 36 alphanumerics
   'gh[pousr]_[A-Za-z0-9]{36,}',
+  // GitHub fine-grained PATs (github_pat_ prefix) NOT covered by the classic gh[pousr]_ form
+  'github_pat_[A-Za-z0-9_]{22,}',
   // GitLab PATs (minimum 20 chars)
   'glpat-[A-Za-z0-9_\\-]{20,}',
-  // Generic API key assignment patterns (common names + length constraint)
-  '(?:api[_-]?key|secret|token|password|credential)["\'\\s:=]+["\']?[A-Za-z0-9_/+=\\-]{16,}["\']?',
+  // Generic secret assignment patterns. Case-insensitive keyword names via char-class
+  // alternation because compilePattern uses 'gu' flags with NO 'i'. The trailing
+  // [A-Za-z0-9_]* lets the keyword sit inside a larger identifier so UPPERCASE env-style
+  // names like AWS_SECRET_ACCESS_KEY=... and bare TOKEN=... are redacted.
+  '(?:[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll])[A-Za-z0-9_]*["\'\\s:=]+["\']?[A-Za-z0-9_/+=\\-]{16,}["\']?',
 ];
 
 const DEFAULT_PRIVACY: PrivacyOptions = {
