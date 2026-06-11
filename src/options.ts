@@ -31,10 +31,25 @@ const DEFAULT_RETENTION: RetentionPolicyOptions = {
   orphanBlobDays: 14,
 };
 
+export const DEFAULT_REDACT_PATTERNS: string[] = [
+  // AWS access keys (starts with AKIA + 16 uppercase alphanumerics)
+  'AKIA[0-9A-Z]{16}',
+  // HTTP Bearer tokens (minimum 16 chars after Bearer whitespace to reduce false positives)
+  'Bearer\\s+[A-Za-z0-9._\\-]{16,}',
+  // PEM private key blocks (uses [\s\S] because compilePattern uses 'gu' flags, NO dotAll)
+  '-----BEGIN[A-Z ]+PRIVATE KEY-----[\\s\\S]+?-----END[A-Z ]+PRIVATE KEY-----',
+  // GitHub PATs (classic/finer-grained) minimum 36 alphanumerics
+  'gh[pousr]_[A-Za-z0-9]{36,}',
+  // GitLab PATs (minimum 20 chars)
+  'glpat-[A-Za-z0-9_\\-]{20,}',
+  // Generic API key assignment patterns (common names + length constraint)
+  '(?:api[_-]?key|secret|token|password|credential)["\'\\s:=]+["\']?[A-Za-z0-9_/+=\\-]{16,}["\']?',
+];
+
 const DEFAULT_PRIVACY: PrivacyOptions = {
   excludeToolPrefixes: [],
   excludePathPatterns: [],
-  redactPatterns: [],
+  redactPatterns: DEFAULT_REDACT_PATTERNS,
 };
 
 const DEFAULT_AUTOMATIC_RETRIEVAL: AutomaticRetrievalOptions = {
@@ -121,6 +136,12 @@ function asStringArray(value: unknown, fallback: string[]): string[] {
   return next.length > 0 ? next : fallback;
 }
 
+function asStringArrayWithExplicitEmpty(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) return fallback;
+  // Explicit array — even [] is respected (true opt-out).
+  return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
+}
+
 function asScopeName(value: unknown, fallback: ScopeName): ScopeName {
   return value === 'session' || value === 'root' || value === 'worktree' || value === 'all'
     ? value
@@ -201,9 +222,15 @@ function asRetentionOptions(
 function asPrivacyOptions(value: unknown, fallback: PrivacyOptions): PrivacyOptions {
   const record = asRecord(value);
   return {
-    excludeToolPrefixes: asStringArray(record?.excludeToolPrefixes, fallback.excludeToolPrefixes),
-    excludePathPatterns: asStringArray(record?.excludePathPatterns, fallback.excludePathPatterns),
-    redactPatterns: asStringArray(record?.redactPatterns, fallback.redactPatterns),
+    excludeToolPrefixes: asStringArrayWithExplicitEmpty(
+      record?.excludeToolPrefixes,
+      fallback.excludeToolPrefixes,
+    ),
+    excludePathPatterns: asStringArrayWithExplicitEmpty(
+      record?.excludePathPatterns,
+      fallback.excludePathPatterns,
+    ),
+    redactPatterns: asStringArrayWithExplicitEmpty(record?.redactPatterns, fallback.redactPatterns),
   };
 }
 
