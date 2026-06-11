@@ -93,6 +93,61 @@ function createStore(
   return new SqliteLcmStore(directory, options);
 }
 
+type StoreHooks = Pick<
+  Hooks,
+  | 'event'
+  | 'experimental.chat.messages.transform'
+  | 'experimental.chat.system.transform'
+  | 'experimental.session.compacting'
+>;
+
+function logHookError(hookName: string, error: unknown): void {
+  process.stderr.write(
+    `[opencode-lcm] ${hookName}: ${error instanceof Error ? error.message : String(error)}\n`,
+  );
+}
+
+export function createStoreHooks(store: LcmStore): StoreHooks {
+  return {
+    event: async ({ event }) => {
+      try {
+        await store.captureDeferred(event);
+      } catch (error) {
+        logHookError('event hook failed (captureDeferred)', error);
+      }
+    },
+
+    'experimental.chat.messages.transform': async (_input, output) => {
+      try {
+        await store.transformMessages(output.messages);
+      } catch (error) {
+        logHookError('messages.transform hook failed', error);
+      }
+    },
+
+    'experimental.chat.system.transform': async (_input, output) => {
+      try {
+        const hint = store.systemHint();
+        if (!hint) return;
+        output.system.push(hint);
+      } catch (error) {
+        logHookError('system.transform hook failed', error);
+      }
+    },
+
+    'experimental.session.compacting': async (input, output) => {
+      try {
+        const note = await store.buildCompactionContext(input.sessionID);
+        if (!note) return;
+        if (output.context.some((entry) => entry.includes('LCM prototype resume note'))) return;
+        output.context.push(note);
+      } catch (error) {
+        logHookError('session.compacting hook failed', error);
+      }
+    },
+  };
+}
+
 export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
   const options = resolveOptions(rawOptions);
   const bunWindowsSafety = resolveBunWindowsSafety(options);
@@ -113,9 +168,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
   }
 
   return {
-    event: async ({ event }) => {
-      await store.captureDeferred(event);
-    },
+    ...createStoreHooks(store),
 
     tool: {
       lcm_status: tool({
@@ -433,23 +486,6 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
           });
         },
       }),
-    },
-
-    'experimental.chat.messages.transform': async (_input, output) => {
-      await store.transformMessages(output.messages);
-    },
-
-    'experimental.chat.system.transform': async (_input, output) => {
-      const hint = store.systemHint();
-      if (!hint) return;
-      output.system.push(hint);
-    },
-
-    'experimental.session.compacting': async (input, output) => {
-      const note = await store.buildCompactionContext(input.sessionID);
-      if (!note) return;
-      if (output.context.some((entry) => entry.includes('LCM prototype resume note'))) return;
-      output.context.push(note);
     },
   };
 };
