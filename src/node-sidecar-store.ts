@@ -19,6 +19,7 @@ import type {
   RetentionInput,
   SessionIDInput,
 } from './lcm-store.js';
+import { buildChildEnv, nodeExecutable } from './node-sidecar-env.js';
 import type { ConversationMessage, OpencodeLcmOptions, SearchResult, StoreStats } from './types.js';
 
 type SidecarResponse =
@@ -47,9 +48,7 @@ function formatSidecarError(error: { name?: string; message: string; stack?: str
   return wrapped;
 }
 
-function nodeExecutable(): string {
-  return process.env.OPENCODE_LCM_NODE_PATH || process.env.NODE || 'node';
-}
+export { buildChildEnv, nodeExecutable } from './node-sidecar-env.js';
 
 function localSystemHint(options: OpencodeLcmOptions): string | undefined {
   if (!options.systemHint) return undefined;
@@ -185,10 +184,7 @@ export class NodeSidecarLcmStore implements LcmStore {
     if (this.child) return;
     const scriptPath = fileURLToPath(new URL('./node-sidecar.js', import.meta.url));
     const child = spawn(nodeExecutable(), ['--no-warnings', scriptPath], {
-      env: {
-        ...process.env,
-        OPENCODE_LCM_SQLITE_RUNTIME: 'node',
-      },
+      env: buildChildEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
