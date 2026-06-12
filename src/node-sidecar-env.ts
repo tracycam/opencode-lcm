@@ -23,6 +23,34 @@ export function nodeExecutable(): string {
 }
 
 /**
+ * Maximum byte length of a single newline-delimited JSON sidecar message.
+ *
+ * The cap protects both the client (oversized outbound request) and the server
+ * (oversized inbound line) from unbounded buffering. It can be lowered for tests
+ * via `OPENCODE_LCM_SIDECAR_MAX_MESSAGE_BYTES`. Because the cap must match on both
+ * ends of the protocol and that env var starts with `OPENCODE_LCM_`, it is
+ * forwarded to the child automatically by `buildChildEnv()`.
+ */
+export const MAX_SIDECAR_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Resolve the per-message byte cap, honoring a positive-integer
+ * `OPENCODE_LCM_SIDECAR_MAX_MESSAGE_BYTES` override. Invalid overrides (not a
+ * positive integer) are ignored with a warning and the default is used.
+ */
+export function resolveMaxMessageBytes(): number {
+  const override = process.env.OPENCODE_LCM_SIDECAR_MAX_MESSAGE_BYTES;
+  if (override !== undefined) {
+    const parsed = Number(override);
+    if (Number.isInteger(parsed) && parsed > 0) return parsed;
+    process.stderr.write(
+      `[opencode-lcm] ignoring invalid OPENCODE_LCM_SIDECAR_MAX_MESSAGE_BYTES (not a positive integer): ${override}\n`,
+    );
+  }
+  return MAX_SIDECAR_MESSAGE_BYTES;
+}
+
+/**
  * Environment variables that are safe to forward to the sidecar child process.
  * Includes cross-platform locale, temp, and home directory keys for both Unix
  * (TMPDIR, HOME) and Windows (TEMP/TMP, SystemRoot, USERPROFILE, WINDIR).

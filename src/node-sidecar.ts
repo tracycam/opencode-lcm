@@ -16,6 +16,7 @@ import type {
   RetentionInput,
   SessionIDInput,
 } from './lcm-store.js';
+import { resolveMaxMessageBytes } from './node-sidecar-env.js';
 import { SqliteLcmStore } from './store.js';
 import type { ConversationMessage, OpencodeLcmOptions } from './types.js';
 
@@ -27,6 +28,7 @@ type RequestMessage = {
 
 let store: SqliteLcmStore | undefined;
 let chain = Promise.resolve();
+const maxMessageBytes = resolveMaxMessageBytes();
 
 function writeResponse(id: number, body: { result: unknown } | { error: unknown }): void {
   process.stdout.write(`${JSON.stringify({ id, ...body })}\n`);
@@ -116,16 +118,45 @@ const rl = createInterface({
   crlfDelay: Number.POSITIVE_INFINITY,
 });
 
+async function processLine(line: string): Promise<void> {
+  if (Buffer.byteLength(line) > maxMessageBytes) {
+    // Defensive guard: the client rejects oversized payloads before sending, so a
+    // line over the cap means protocol corruption/abuse. We cannot trust the
+    // contents enough to recover an id, so we log to stderr and skip rather than
+    // risk wedging the serial chain. Subsequent valid lines are unaffected.
+    process.stderr.write(
+      `[opencode-lcm sidecar] dropping oversized request line (${Buffer.byteLength(line)} bytes, cap ${maxMessageBytes})\n`,
+    );
+    return;
+  }
+  let request: RequestMessage;
+  try {
+    request = JSON.parse(line) as RequestMessage;
+  } catch (error) {
+    // A malformed line must never break subsequent requests: log and skip.
+    process.stderr.write(
+      `[opencode-lcm sidecar] skipping malformed request line: ${serializeError(error).message}\n`,
+    );
+    return;
+  }
+  try {
+    const result = await handleRequest(request);
+    writeResponse(request.id, { result });
+  } catch (error) {
+    writeResponse(request.id, { error: serializeError(error) });
+  }
+}
+
 rl.on('line', (line) => {
-  chain = chain.then(async () => {
-    const request = JSON.parse(line) as RequestMessage;
-    try {
-      const result = await handleRequest(request);
-      writeResponse(request.id, { result });
-    } catch (error) {
-      writeResponse(request.id, { error: serializeError(error) });
-    }
-  });
+  // Keep requests serial, but ensure the chain NEVER rejects: a thrown error in
+  // one line handler must not short-circuit every subsequent line.
+  chain = chain
+    .then(() => processLine(line))
+    .catch((error) => {
+      process.stderr.write(
+        `[opencode-lcm sidecar] unexpected line-handler failure: ${serializeError(error).message}\n`,
+      );
+    });
 });
 
 rl.on('close', () => {

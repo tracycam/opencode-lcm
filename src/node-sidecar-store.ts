@@ -19,8 +19,12 @@ import type {
   RetentionInput,
   SessionIDInput,
 } from './lcm-store.js';
-import { buildChildEnv, nodeExecutable } from './node-sidecar-env.js';
+import { buildChildEnv, nodeExecutable, resolveMaxMessageBytes } from './node-sidecar-env.js';
 import type { ConversationMessage, OpencodeLcmOptions, SearchResult, StoreStats } from './types.js';
+
+// Cap on consecutive automatic respawns (without an intervening successful
+// request) before the store fails fast instead of looping on a dead sidecar.
+const MAX_SIDECAR_RESTARTS = 3;
 
 type SidecarResponse =
   | { id: number; result: unknown }
@@ -68,6 +72,15 @@ export class NodeSidecarLcmStore implements LcmStore {
   private stdoutBuffer = '';
   private stderrBuffer = '';
   private closed = false;
+  // Whether init() ever succeeded; gates automatic init replay after a respawn.
+  private initialized = false;
+  // Whether the CURRENT child process has an initialized store.
+  private childInitialized = false;
+  // Consecutive respawns since the last successful request (crash-loop guard).
+  private restartCount = 0;
+  // stderr captured from the most recent crash, surfaced in fail-fast errors.
+  private lastStderr = '';
+  private readonly maxMessageBytes = resolveMaxMessageBytes();
 
   constructor(
     private readonly projectDir: string,
@@ -76,10 +89,12 @@ export class NodeSidecarLcmStore implements LcmStore {
 
   async init(): Promise<void> {
     this.ensureStarted();
-    await this.request('init', {
+    await this.send('init', {
       projectDir: this.projectDir,
       options: this.options,
     });
+    this.childInitialized = true;
+    this.initialized = true;
   }
 
   close(): void {
@@ -196,19 +211,49 @@ export class NodeSidecarLcmStore implements LcmStore {
     child.stderr.on('data', (chunk) => {
       this.stderrBuffer = (this.stderrBuffer + chunk).slice(-4000);
     });
-    child.once('error', (error) => this.rejectAll(error));
+    child.once('error', (error) => this.teardownChild(error, false));
     child.once('exit', (code, signal) => {
-      if (this.closed) return;
       const suffix = this.stderrBuffer ? `\nSidecar stderr:\n${this.stderrBuffer}` : '';
-      this.rejectAll(
+      this.teardownChild(
         new Error(`opencode-lcm Node sidecar exited code=${code} signal=${signal}${suffix}`),
+        false,
       );
     });
     this.updateRefs();
   }
 
-  private request(method: string, params: unknown): Promise<unknown> {
-    this.ensureStarted();
+  private async request(method: string, params: unknown): Promise<unknown> {
+    await this.ensureReady();
+    const result = await this.send(method, params);
+    // A completed request proves the sidecar is healthy again.
+    this.restartCount = 0;
+    return result;
+  }
+
+  // Ensure a live, store-initialized child exists before dispatching a request.
+  // Respawns a crashed sidecar (bounded by MAX_SIDECAR_RESTARTS) and replays the
+  // init request so the fresh process has a store. Replay failures propagate.
+  private async ensureReady(): Promise<void> {
+    if (!this.child) {
+      if (this.restartCount >= MAX_SIDECAR_RESTARTS) {
+        const suffix = this.lastStderr ? `\nLast sidecar stderr:\n${this.lastStderr}` : '';
+        throw new Error(
+          `opencode-lcm Node sidecar exceeded ${MAX_SIDECAR_RESTARTS} consecutive restart attempts; refusing to respawn.${suffix}`,
+        );
+      }
+      this.restartCount += 1;
+      this.ensureStarted();
+    }
+    if (this.initialized && !this.childInitialized) {
+      await this.send('init', {
+        projectDir: this.projectDir,
+        options: this.options,
+      });
+      this.childInitialized = true;
+    }
+  }
+
+  private send(method: string, params: unknown): Promise<unknown> {
     const child = this.child;
     if (!child?.stdin.writable) {
       return Promise.reject(new Error('opencode-lcm Node sidecar is not writable'));
@@ -217,10 +262,20 @@ export class NodeSidecarLcmStore implements LcmStore {
     const id = this.nextID;
     this.nextID += 1;
 
+    const message = `${JSON.stringify({ id, method, params })}\n`;
+    const byteLength = Buffer.byteLength(message);
+    if (byteLength > this.maxMessageBytes) {
+      return Promise.reject(
+        new Error(
+          `opencode-lcm sidecar request '${method}' is ${byteLength} bytes, exceeding the ${this.maxMessageBytes}-byte message limit`,
+        ),
+      );
+    }
+
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       this.updateRefs();
-      child.stdin.write(`${JSON.stringify({ id, method, params })}\n`, (error) => {
+      child.stdin.write(message, (error) => {
         if (!error) return;
         this.pending.delete(id);
         this.updateRefs();
@@ -231,6 +286,20 @@ export class NodeSidecarLcmStore implements LcmStore {
 
   private handleStdout(chunk: string): void {
     this.stdoutBuffer += chunk;
+    if (
+      this.stdoutBuffer.indexOf('\n') === -1 &&
+      Buffer.byteLength(this.stdoutBuffer) > this.maxMessageBytes
+    ) {
+      // Fatal protocol error: a single response line exceeded the cap without a
+      // newline. Tear the child down so the recovery path respawns it lazily.
+      this.teardownChild(
+        new Error(
+          `opencode-lcm sidecar response exceeded the ${this.maxMessageBytes}-byte message limit without a newline`,
+        ),
+        true,
+      );
+      return;
+    }
     for (;;) {
       const newline = this.stdoutBuffer.indexOf('\n');
       if (newline === -1) break;
@@ -262,6 +331,21 @@ export class NodeSidecarLcmStore implements LcmStore {
     this.updateRefs();
   }
 
+  // Reject all pending requests and, unless the store is closed, drop the child
+  // reference so the next request lazily respawns it. `kill` is set when we are
+  // proactively killing a still-running child (e.g. on a protocol violation).
+  private teardownChild(error: Error, kill: boolean): void {
+    const child = this.child;
+    if (this.stderrBuffer) this.lastStderr = this.stderrBuffer;
+    this.rejectAll(error);
+    if (this.closed) return;
+    this.child = undefined;
+    this.childInitialized = false;
+    this.stdoutBuffer = '';
+    this.stderrBuffer = '';
+    if (kill) child?.kill();
+  }
+
   private updateRefs(): void {
     const child = this.child;
     if (!child) return;
@@ -281,5 +365,13 @@ export class NodeSidecarLcmStore implements LcmStore {
     const child = this.child;
     if (!child) return;
     await once(child, 'exit');
+  }
+
+  getChildPidForTests(): number | undefined {
+    return this.child?.pid;
+  }
+
+  killChildForTests(): void {
+    this.child?.kill('SIGKILL');
   }
 }
