@@ -4,6 +4,7 @@ import type { LcmStore } from './lcm-store.js';
 import { NodeSidecarLcmStore } from './node-sidecar-store.js';
 import { resolveOptions } from './options.js';
 import { SqliteLcmStore } from './store.js';
+import { createStoreHooks } from './store-hooks.js';
 import type { OpencodeLcmOptions } from './types.js';
 
 type PluginWithOptions = (ctx: PluginInput, rawOptions?: unknown) => Promise<Hooks>;
@@ -91,61 +92,6 @@ function createStore(
 ): LcmStore {
   if (backend === 'node_sidecar') return new NodeSidecarLcmStore(directory, options);
   return new SqliteLcmStore(directory, options);
-}
-
-type StoreHooks = Pick<
-  Hooks,
-  | 'event'
-  | 'experimental.chat.messages.transform'
-  | 'experimental.chat.system.transform'
-  | 'experimental.session.compacting'
->;
-
-function logHookError(hookName: string, error: unknown): void {
-  process.stderr.write(
-    `[opencode-lcm] ${hookName}: ${error instanceof Error ? error.message : String(error)}\n`,
-  );
-}
-
-export function createStoreHooks(store: LcmStore): StoreHooks {
-  return {
-    event: async ({ event }) => {
-      try {
-        await store.captureDeferred(event);
-      } catch (error) {
-        logHookError('event hook failed (captureDeferred)', error);
-      }
-    },
-
-    'experimental.chat.messages.transform': async (_input, output) => {
-      try {
-        await store.transformMessages(output.messages);
-      } catch (error) {
-        logHookError('messages.transform hook failed', error);
-      }
-    },
-
-    'experimental.chat.system.transform': async (_input, output) => {
-      try {
-        const hint = store.systemHint();
-        if (!hint) return;
-        output.system.push(hint);
-      } catch (error) {
-        logHookError('system.transform hook failed', error);
-      }
-    },
-
-    'experimental.session.compacting': async (input, output) => {
-      try {
-        const note = await store.buildCompactionContext(input.sessionID);
-        if (!note) return;
-        if (output.context.some((entry) => entry.includes('LCM prototype resume note'))) return;
-        output.context.push(note);
-      } catch (error) {
-        logHookError('session.compacting hook failed', error);
-      }
-    },
-  };
 }
 
 export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {

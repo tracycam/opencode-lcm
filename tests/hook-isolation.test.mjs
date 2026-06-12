@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createStoreHooks } from '../dist/index.js';
+import { createStoreHooks } from '../dist/store-hooks.js';
 
 async function withCapturedStderr(run) {
   const original = process.stderr.write;
