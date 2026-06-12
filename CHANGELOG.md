@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Cross-process advisory maintenance lock (`.lcm/maintenance.lock`, zero-dependency) gates background/automatic store maintenance (deferred-init retention prune, summary rebuild, FTS refresh) so concurrent OpenCode instances no longer duplicate heavy work; stale locks (unparseable, older than 10 minutes, or owned by a dead pid) are reclaimed automatically. Explicit `lcm_retention_prune` and `lcm_doctor` (apply) report `maintenance is already running in another OpenCode instance; retry later` instead of silently skipping when the lock is held
+
+### Changed
+- Retention pruning now runs each session deletion in its own transaction (and the orphan-blob sweep in a separate transaction) instead of one large transaction, bounding write-lock hold time so a second OpenCode instance is not starved past its SQLite busy timeout; pruning remains idempotent, so a mid-run failure leaves earlier deletions committed and the next run resumes the rest
+
+### Fixed
+- Node sidecar now recovers from a crashed child: the client clears the dead process reference, lazily respawns it on the next request, and automatically replays `init` so the fresh process has an initialized store (previously the store stayed permanently dead until host restart)
+- Node sidecar respawns are bounded by a consecutive-restart cap (3) so a crash-looping child fails fast with a descriptive error (including the last sidecar stderr) instead of looping forever; a successful request resets the counter
+- Node sidecar enforces a per-message byte cap (`MAX_SIDECAR_MESSAGE_BYTES`, 64 MiB, overridable via `OPENCODE_LCM_SIDECAR_MAX_MESSAGE_BYTES`): oversized client requests reject without killing the sidecar, an unbounded stdout buffer with no newline is treated as a fatal protocol error that tears down and respawns the child, and the server drops oversized inbound lines defensively
+- Node sidecar server no longer wedges on a malformed request line: JSON parsing moved inside the per-line handler and the serial promise chain can never reject, so a single bad line is logged and skipped without short-circuiting every subsequent request
+
 ## [0.14.2] - 2026-04-18
 
 ### Fixed

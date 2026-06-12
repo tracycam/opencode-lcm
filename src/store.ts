@@ -23,6 +23,7 @@ import {
 } from './constants.js';
 import { type DoctorReport, type DoctorSessionIssue, formatDoctorReport } from './doctor.js';
 import { getLogger, isStartupLoggingEnabled } from './logging.js';
+import { acquireMaintenanceLock } from './maintenance-lock.js';
 import {
   type CompiledPrivacyOptions,
   compilePrivacyOptions,
@@ -917,6 +918,14 @@ export class SqliteLcmStore {
     return this.options.storeDir === undefined || this.options.storeDir === '.lcm';
   }
 
+  /**
+   * Path to the cross-process advisory maintenance lock, kept next to the DB so it
+   * follows any fallback base-dir relocation. Gates background maintenance only.
+   */
+  private maintenanceLockPath(): string {
+    return path.join(this.baseDir, 'maintenance.lock');
+  }
+
   private resolveFallbackBaseDir(): string {
     const worktreeKey = normalizeWorktreeKey(this.workspaceDirectory) ?? this.workspaceDirectory;
     const suffix = createHash('sha256').update(worktreeKey).digest('hex').slice(0, 16);
@@ -1391,26 +1400,43 @@ export class SqliteLcmStore {
 
   private completeDeferredInit(): void {
     if (this.deferredInitCompleted) return;
-    if (this.hasPendingArtifactBlobBackfillSync()) {
-      logStartupPhase('deferred-init:artifact-backfill');
-      this.backfillArtifactBlobsSync();
+
+    // Gate background maintenance behind a cross-process advisory lock so concurrent
+    // OpenCode instances do not duplicate heavy work. If another live process holds it,
+    // skip silently this cycle; deferredInitCompleted stays false so a later capture/read
+    // retries once the lock frees.
+    const lock = acquireMaintenanceLock(this.maintenanceLockPath());
+    if (!lock) {
+      getLogger().debug('Skipping deferred LCM maintenance; lock held by another process', {
+        lockPath: this.maintenanceLockPath(),
+      });
+      return;
     }
-    logStartupPhase('deferred-init:orphan-blob-cleanup');
-    this.deleteOrphanArtifactBlobsSync();
-    if (
-      this.options.retention.staleSessionDays !== undefined ||
-      this.options.retention.deletedSessionDays !== undefined ||
-      this.options.retention.orphanBlobDays !== undefined
-    ) {
-      logStartupPhase('deferred-init:retention-prune');
-      this.applyRetentionPruneSync({ apply: true });
+
+    try {
+      if (this.hasPendingArtifactBlobBackfillSync()) {
+        logStartupPhase('deferred-init:artifact-backfill');
+        this.backfillArtifactBlobsSync();
+      }
+      logStartupPhase('deferred-init:orphan-blob-cleanup');
+      this.deleteOrphanArtifactBlobsSync();
+      if (
+        this.options.retention.staleSessionDays !== undefined ||
+        this.options.retention.deletedSessionDays !== undefined ||
+        this.options.retention.orphanBlobDays !== undefined
+      ) {
+        logStartupPhase('deferred-init:retention-prune');
+        this.applyRetentionPruneSync({ apply: true });
+      }
+      if (this.hasPendingLineageRefreshSync()) {
+        logStartupPhase('deferred-init:lineage-refresh');
+        this.refreshAllLineageSync();
+      }
+      logStartupPhase('deferred-init:done');
+      this.deferredInitCompleted = true;
+    } finally {
+      lock.release();
     }
-    if (this.hasPendingLineageRefreshSync()) {
-      logStartupPhase('deferred-init:lineage-refresh');
-      this.refreshAllLineageSync();
-    }
-    logStartupPhase('deferred-init:done');
-    this.deferredInitCompleted = true;
   }
 
   private hasPendingArtifactBlobBackfillSync(): boolean {
@@ -1828,50 +1854,61 @@ export class SqliteLcmStore {
       return formatDoctorReport(before, limit);
     }
 
-    const checkedSessions = sessionID
-      ? [sessionID]
-      : this.readAllSessionsSync().map((session) => session.sessionID);
-    const appliedActions: string[] = [];
-
-    this.ensureSessionColumnsSync();
-    this.ensureSummaryStateColumnsSync();
-    this.ensureArtifactColumnsSync();
-    appliedActions.push('ensured schema columns');
-
-    if (before.summarySessionsNeedingRebuild.length > 0 || before.orphanSummaryEdges > 0) {
-      this.rebuildSummarySessionsSync(checkedSessions);
-      appliedActions.push(`rebuilt summary DAGs for ${checkedSessions.length} checked session(s)`);
+    const lock = acquireMaintenanceLock(this.maintenanceLockPath());
+    if (!lock) {
+      return 'maintenance is already running in another OpenCode instance; retry later';
     }
 
-    if (before.lineageSessionsNeedingRefresh.length > 0) {
-      this.refreshAllLineageSync();
-      this.syncAllDerivedSessionStateSync(true);
-      appliedActions.push('refreshed lineage metadata');
-    }
+    try {
+      const checkedSessions = sessionID
+        ? [sessionID]
+        : this.readAllSessionsSync().map((session) => session.sessionID);
+      const appliedActions: string[] = [];
 
-    if (before.orphanArtifactBlobs > 0) {
-      this.backfillArtifactBlobsSync();
-      const deleted = this.deleteOrphanArtifactBlobsSync();
-      if (deleted.length > 0) {
-        appliedActions.push(`deleted ${deleted.length} orphan artifact blob(s)`);
+      this.ensureSessionColumnsSync();
+      this.ensureSummaryStateColumnsSync();
+      this.ensureArtifactColumnsSync();
+      appliedActions.push('ensured schema columns');
+
+      if (before.summarySessionsNeedingRebuild.length > 0 || before.orphanSummaryEdges > 0) {
+        this.rebuildSummarySessionsSync(checkedSessions);
+        appliedActions.push(
+          `rebuilt summary DAGs for ${checkedSessions.length} checked session(s)`,
+        );
       }
-    }
 
-    if (
-      before.messageFts.expected !== before.messageFts.actual ||
-      before.summaryFts.expected !== before.summaryFts.actual ||
-      before.artifactFts.expected !== before.artifactFts.actual ||
-      before.summarySessionsNeedingRebuild.length > 0 ||
-      before.orphanSummaryEdges > 0
-    ) {
-      this.refreshSearchIndexesSync(checkedSessions);
-      appliedActions.push('rebuilt FTS indexes');
-    }
+      if (before.lineageSessionsNeedingRefresh.length > 0) {
+        this.refreshAllLineageSync();
+        this.syncAllDerivedSessionStateSync(true);
+        appliedActions.push('refreshed lineage metadata');
+      }
 
-    const after = this.collectDoctorReport(sessionID);
-    after.status = this.hasDoctorIssues(after) ? 'issues-found' : 'repaired';
-    after.appliedActions = appliedActions;
-    return formatDoctorReport(after, limit);
+      if (before.orphanArtifactBlobs > 0) {
+        this.backfillArtifactBlobsSync();
+        const deleted = this.deleteOrphanArtifactBlobsSync();
+        if (deleted.length > 0) {
+          appliedActions.push(`deleted ${deleted.length} orphan artifact blob(s)`);
+        }
+      }
+
+      if (
+        before.messageFts.expected !== before.messageFts.actual ||
+        before.summaryFts.expected !== before.summaryFts.actual ||
+        before.artifactFts.expected !== before.artifactFts.actual ||
+        before.summarySessionsNeedingRebuild.length > 0 ||
+        before.orphanSummaryEdges > 0
+      ) {
+        this.refreshSearchIndexesSync(checkedSessions);
+        appliedActions.push('rebuilt FTS indexes');
+      }
+
+      const after = this.collectDoctorReport(sessionID);
+      after.status = this.hasDoctorIssues(after) ? 'issues-found' : 'repaired';
+      after.appliedActions = appliedActions;
+      return formatDoctorReport(after, limit);
+    } finally {
+      lock.release();
+    }
   }
 
   private collectDoctorReport(sessionID?: string): DoctorReport {
@@ -2273,21 +2310,30 @@ export class SqliteLcmStore {
     }
 
     const db = this.getDb();
-    let deletedBlobs: RetentionBlobCandidate[] = [];
-    withTransaction(db, 'retentionPrune', () => {
-      for (const sessionID of uniqueSessionIDs) {
-        this.clearSessionDataSync(sessionID);
-      }
+    // Chunked prune: each session deletion runs in its OWN transaction (and the final
+    // orphan-blob deletion in its own) to bound write-lock hold time, so a second OpenCode
+    // instance is not starved past its busy_timeout while a large backlog is pruned.
+    // Retention is idempotent: if a chunk throws partway through, earlier deletions stay
+    // committed and the next run resumes the rest. We let the error propagate and only
+    // return counts on full success.
+    for (const sessionID of uniqueSessionIDs) {
+      withTransaction(db, 'retentionPrune:session', () => this.clearSessionDataSync(sessionID));
+    }
 
-      deletedBlobs =
-        policy.orphanBlobDays === undefined
-          ? []
-          : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
-      if (deletedBlobs.length > 0) {
+    // Re-read orphan blobs AFTER session deletions (removing sessions drops their
+    // artifacts, which can newly orphan blobs), INSIDE the transaction so the read and
+    // the deletes share one snapshot and cannot delete a blob that a concurrent process
+    // just re-referenced.
+    const orphanBlobDays = policy.orphanBlobDays;
+    let deletedBlobs: RetentionBlobCandidate[] = [];
+    if (orphanBlobDays !== undefined) {
+      withTransaction(db, 'retentionPrune:blobs', () => {
+        deletedBlobs = this.readOrphanBlobRetentionCandidates(orphanBlobDays);
+        if (deletedBlobs.length === 0) return;
         const deleteBlob = db.prepare('DELETE FROM artifact_blobs WHERE content_hash = ?');
         for (const blob of deletedBlobs) deleteBlob.run(blob.content_hash);
-      }
-    });
+      });
+    }
 
     if (uniqueSessionIDs.length > 0) {
       this.refreshAllLineageSync();
@@ -3141,41 +3187,52 @@ export class SqliteLcmStore {
       ].join('\n');
     }
 
-    const result = this.applyRetentionPruneSync({ ...input, apply: true });
-
-    let combinedPreview: string[] = [];
-    if (combinedSessions.length > 0) {
-      combinedPreview = [
-        'deleted_sessions_preview:',
-        ...combinedSessions.slice(0, limit).map((row) => this.formatRetentionSessionCandidate(row)),
-      ];
-    } else {
-      combinedPreview = ['deleted_sessions_preview:', '- none'];
+    const lock = acquireMaintenanceLock(this.maintenanceLockPath());
+    if (!lock) {
+      return 'maintenance is already running in another OpenCode instance; retry later';
     }
 
-    let deletedBlobPreview: string[] = [];
-    if (initialOrphanBlobs.length > 0) {
-      deletedBlobPreview = [
-        'deleted_blobs_preview:',
-        ...initialOrphanBlobs
-          .slice(0, limit)
-          .map(
-            (row) =>
-              `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
-          ),
-      ];
-    } else {
-      deletedBlobPreview = ['deleted_blobs_preview:', '- none'];
-    }
+    try {
+      const result = this.applyRetentionPruneSync({ ...input, apply: true });
 
-    return [
-      `deleted_sessions=${result.deletedSessions}`,
-      `deleted_blobs=${result.deletedBlobs}`,
-      `deleted_blob_chars=${result.deletedBlobChars}`,
-      'status=applied',
-      ...combinedPreview,
-      ...deletedBlobPreview,
-    ].join('\n');
+      let combinedPreview: string[] = [];
+      if (combinedSessions.length > 0) {
+        combinedPreview = [
+          'deleted_sessions_preview:',
+          ...combinedSessions
+            .slice(0, limit)
+            .map((row) => this.formatRetentionSessionCandidate(row)),
+        ];
+      } else {
+        combinedPreview = ['deleted_sessions_preview:', '- none'];
+      }
+
+      let deletedBlobPreview: string[] = [];
+      if (initialOrphanBlobs.length > 0) {
+        deletedBlobPreview = [
+          'deleted_blobs_preview:',
+          ...initialOrphanBlobs
+            .slice(0, limit)
+            .map(
+              (row) =>
+                `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+            ),
+        ];
+      } else {
+        deletedBlobPreview = ['deleted_blobs_preview:', '- none'];
+      }
+
+      return [
+        `deleted_sessions=${result.deletedSessions}`,
+        `deleted_blobs=${result.deletedBlobs}`,
+        `deleted_blob_chars=${result.deletedBlobChars}`,
+        'status=applied',
+        ...combinedPreview,
+        ...deletedBlobPreview,
+      ].join('\n');
+    } finally {
+      lock.release();
+    }
   }
 
   async exportSnapshot(input: {
